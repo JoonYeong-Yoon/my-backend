@@ -1,58 +1,65 @@
+import os, torch
+from enum import Enum
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from fastapi.responses import FileResponse
+from PIL import Image
+from torchvision import transforms
+import torch.nn.functional as F
+
 from utils.exceptions import InvalidFileException, ModelNotLoadedException
+
 from utils.auth import get_current_user
-from services.restoration_service import restoration_service
-import os
-from typing import List
-from enum import Enum
+from utils.image import validate_image
+from config.settings import UPLOAD_DIR,RESULT_DIR
+from network.restoration_model import RestorationModel
+from network.colorization_model import ColorizationModel
+from network.models import uformer
+# from services.restoration_service import restoration_service
 
-router = APIRouter()
-UPLOAD_DIR = "uploads"
-RESULT_DIR = "processed"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(RESULT_DIR, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {"jpeg", "jpg", "png", "bmp"}
+def pad_to_divisible(x, div=16):
+    _, _, h, w = x.size()
+    pad_h = (div - h % div) % div
+    pad_w = (div - w % div) % div
+    return F.pad(x, (0, pad_w, 0, pad_h)), h, w
 
 class ProcessingMode(str, Enum):
     COLORIZE = "colorize"
     RESTORE = "restore"
 
-def validate_image(file: UploadFile):
-    # Check file extension
-    ext = file.filename.split(".")[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise InvalidFileException()
-    
-    # Check file content type
-    content_type = file.content_type
-    if not content_type.startswith("image/"):
-        raise InvalidFileException()
+router = APIRouter()
 
-async def process_image(file: UploadFile, mode: ProcessingMode, user_id: int) -> str:
+@router.post("/colorize")
+async def colorize(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+
+    """흑백 이미지를 컬러로 변환"""
     validate_image(file)
-    
-    # Create unique filenames
+    mode = ProcessingMode.COLORIZE
+    user_id = current_user["user_id"]
     safe_filename = f"{user_id}_{file.filename}"
     input_path = os.path.join(UPLOAD_DIR, safe_filename)
     output_filename = f"{mode}d_{safe_filename}"
     output_path = os.path.join(RESULT_DIR, output_filename)
     
+    # Save uploaded file
     try:
-        # Save uploaded file
         content = await file.read()
         with open(input_path, "wb") as f:
             f.write(content)
-            
-        # Process image
-        processed_path = restoration_service.process_image(
-            input_path=input_path,
-            output_path=output_path,
-            mode=mode
+        # todo - > RESIZE 및 모델로드 부분 분리
+        colorize_model = ColorizationModel()
+        pil_data = Image.open(input_path)
+        out_img = colorize_model._process_image(pil_data)
+        # output = output.resize(original_size, Image.BICUBIC)
+        out_img.save(output_path)
+
+        return FileResponse(
+            output_path,
+            media_type="image/png",
+            filename=f"colorized_{file.filename}"
         )
-        
-        return processed_path
     except ValueError as e:
         raise ModelNotLoadedException()
     except Exception as e:
@@ -61,24 +68,8 @@ async def process_image(file: UploadFile, mode: ProcessingMode, user_id: int) ->
         # Cleanup uploaded file
         if os.path.exists(input_path):
             os.remove(input_path)
+            
 
-@router.post("/colorize")
-async def colorize(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
-):
-    """흑백 이미지를 컬러로 변환"""
-    output_path = await process_image(
-        file=file,
-        mode=ProcessingMode.COLORIZE,
-        user_id=current_user["user_id"]
-    )
-    
-    return FileResponse(
-        output_path,
-        media_type="image/png",
-        filename=f"colorized_{file.filename}"
-    )
 
 @router.post("/restore")
 async def restore(
@@ -86,14 +77,56 @@ async def restore(
     current_user: dict = Depends(get_current_user)
 ):
     """훼손된 이미지 복원"""
-    output_path = await process_image(
-        file=file,
-        mode=ProcessingMode.RESTORE,
-        user_id=current_user["user_id"]
-    )
-    
-    return FileResponse(
-        output_path,
-        media_type="image/png",
-        filename=f"restored_{file.filename}"
-    )
+    """흑백 이미지를 컬러로 변환"""
+    validate_image(file)
+    mode = ProcessingMode.COLORIZE
+    user_id = current_user["user_id"]
+    safe_filename = f"{user_id}_{file.filename}"
+    input_path = os.path.join(UPLOAD_DIR, safe_filename)
+    output_filename = f"{mode}d_{safe_filename}"
+    output_path = os.path.join(RESULT_DIR, output_filename)
+    # Save uploaded file
+    try:
+        content = await file.read()
+        with open(input_path, "wb") as f:
+            f.write(content)
+        restoration_model = uformer.UNet(dim = 32)
+        weight_file_path = "network/weights/damageRestoration/uformer_best.pth"
+        restoration_weights = torch.load(weight_file_path,map_location="cpu")
+        restoration_model.load_state_dict(restoration_weights)
+        restoration_model.eval()
+        # todo - > RESIZE 및 모델로드 부분 분리
+        transform = transforms.ToTensor()
+        to_pil = transforms.ToPILImage()
+        img = Image.open(input_path).convert("RGB")
+        orig_w, orig_h = img.size
+
+        img_tensor = transform(img).unsqueeze(0)
+        padded_tensor, orig_h, orig_w = pad_to_divisible(img_tensor, div=16)
+        with torch.no_grad():
+            output_tensor = restoration_model(padded_tensor)
+
+        # crop 원래 크기로
+        output_tensor = output_tensor[:, :, :orig_h, :orig_w]
+
+        # ====== 후처리 및 저장 ======
+        output_img = output_tensor.squeeze(0).cpu()
+        output_img = to_pil(output_img.clamp(0, 1))
+        output_img.save(output_path)
+
+        return FileResponse(
+            output_path,
+            media_type="image/png",
+            filename=f"restored_{file.filename}"
+        )
+
+    except ValueError as e:
+        raise ModelNotLoadedException()
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup uploaded file
+        if os.path.exists(input_path):
+            os.remove(input_path)
+            
